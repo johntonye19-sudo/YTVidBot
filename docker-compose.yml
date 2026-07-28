@@ -1,0 +1,13 @@
+version: '3.8'
+services:
+  ytvbot:
+    build: .
+    environment:
+      - BOT_TOKEN
+      - DOWNLOAD_DIR=downloads
+      - MAX_FILE_MB=50
+      - S3_BUCKET_NAME
+      - AWS_REGION
+    volumes:
+      - ./downloads:/app/downloads
+    restart: unless-stopped
