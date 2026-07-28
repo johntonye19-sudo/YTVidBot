@@ -1,7 +1,8 @@
 import os
 import logging
 import asyncio
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import tempfile
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -10,107 +11,202 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-import yt_dlp
+from services import yt_service, storage
+import config
 
-# Enable logging
+# Setup logging
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-DOWNLOAD_DIR = "downloads"
-if not os.path.exists(DOWNLOAD_DIR):
-    os.makedirs(DOWNLOAD_DIR)
+DOWNLOAD_DIR = config.DOWNLOAD_DIR
+MAX_FILE_MB = config.MAX_FILE_MB
 
-# Limit for standard Telegram bots to upload files is 50MB
-TELEGRAM_FILE_LIMIT_MB = 50 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends a welcome message when the /start command is issued."""
     await update.message.reply_text(
-        "Hi! Send me a YouTube link, and I will help you download the video or extract the audio."
+        "Hi! Send me a YouTube link, and I'll help you download the video or extract the audio."
     )
 
-def extract_video_info(url: str) -> dict:
-    """Helper to extract video info using yt-dlp in a synchronous context."""
-    ydl_opts = {}
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        return {
-            'title': info.get('title', 'video'),
-            'duration': info.get('duration', 0),
-            'id': info.get('id'),
-        }
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Processes incoming messages, checks for links, and displays download choices."""
-    url = update.message.text.strip()
-    
-    if not ("youtube.com" in url or "youtu.be" in url):
+    text = (update.message.text or "").strip()
+    if not ("youtube.com" in text or "youtu.be" in text):
         await update.message.reply_text("Please send a valid YouTube link.")
         return
 
     status_message = await update.message.reply_text("Processing link... Please wait.")
-    
+
     try:
-        # Run synchronous metadata extraction in a separate thread to prevent blocking the event loop
-        info = await asyncio.to_thread(extract_video_info, url)
-        
-        # Save URL and metadata in user_data for retrieval during callback handling
-        context.user_data['url'] = url
-        context.user_data['title'] = info['title']
-        
+        info = await asyncio.to_thread(yt_service.extract_video_info, text)
+        # store url and info
+        context.user_data['url'] = text
+        context.user_data['info'] = info
+
         keyboard = [
             [
-                InlineKeyboardButton("Download Video (MP4)", callback_data='dl_video'),
-                InlineKeyboardButton("Download Audio (MP3)", callback_data='dl_audio')
-            ]
+                InlineKeyboardButton("Download Video (Low)", callback_data='dl_video_low'),
+                InlineKeyboardButton("Download Video (High)", callback_data='dl_video_high'),
+            ],
+            [InlineKeyboardButton("Download Audio (MP3)", callback_data='dl_audio')],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        
+
         await status_message.edit_text(
-            f"Title: {info['title']}\nChoose your preferred format below:",
-            reply_markup=reply_markup
+            f"Title: {info.get('title')}\nChoose a format:", reply_markup=reply_markup
         )
-        
+
     except Exception as e:
-        logger.error(f"Error extracting metadata: {e}")
+        logger.exception("Failed to extract metadata")
         await status_message.edit_text("Failed to extract video information. The link might be broken or private.")
 
-def download_sync(url: str, download_type: str) -> str:
-    """Synchronous download task using yt-dlp."""
-    output_template = os.path.join(DOWNLOAD_DIR, '%(title)s_%(id)s.%(ext)s')
-    
-    if download_type == 'video':
-        ydl_opts = {
-            # Selects best mp4 format under 50MB (often 720p or 360p)
-            'format': 'best[ext=mp4]/best',
-            'outtmpl': output_template,
-            'max_filesize': TELEGRAM_FILE_LIMIT_MB * 1024 * 1024,
-        }
-    else:  # audio
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'outtmpl': output_template,
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }],
-        }
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        filename = ydl.prepare_filename(info)
-        
-        if download_type == 'audio':
-            # After conversion, the extension changes to mp3
-            filename = os.path.splitext(filename)[0] + ".mp3"
-            
-        return filename
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles the user's choice (Video or Audio)."""
-    query = update.call
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
 
+    data = query.data
+    user_data = context.user_data
+    url = user_data.get('url')
+    info = user_data.get('info', {})
+    if not url:
+        await query.message.reply_text("No URL found in your session. Please resend the link.")
+        return
+
+    download_type = 'video'
+    format_label = 'standard'
+    if data == 'dl_audio':
+        download_type = 'audio'
+        format_label = 'audio'
+    elif data == 'dl_video_low':
+        download_type = 'video_low'
+        format_label = 'low'
+    elif data == 'dl_video_high':
+        download_type = 'video_high'
+        format_label = 'high'
+    else:
+        await query.message.reply_text("Unknown option.")
+        return
+
+    status = await query.message.reply_text("Starting download...")
+
+    # Create a queue for progress updates
+    progress_queue = asyncio.Queue()
+
+    loop = asyncio.get_running_loop()
+
+    def progress_reporter(d):
+        # called from yt-dlp thread; push to asyncio queue safely
+        loop.call_soon_threadsafe(progress_queue.put_nowait, d)
+
+    # Use a temporary directory for download
+    tmpdir = tempfile.mkdtemp(prefix='ytbot_')
+
+    try:
+        # run download in thread
+        download_task = asyncio.to_thread(
+            yt_service.download_with_progress,
+            url,
+            download_type,
+            tmpdir,
+            progress_reporter,
+            format_label,
+        )
+
+        # Start a coroutine that reads progress_queue and edits the status message
+        async def progress_watcher():
+            last_pct = None
+            while True:
+                try:
+                    d = await asyncio.wait_for(progress_queue.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    # check if download finished
+                    if download_task.done():
+                        break
+                    continue
+
+                status_text = d.get('status')
+                if status_text == 'downloading':
+                    pct = d.get('downloaded_bytes') and d.get('total_bytes') and (
+                        round(d['downloaded_bytes'] / d['total_bytes'] * 100, 1)
+                        if d['total_bytes']
+                        else None
+                    )
+                    if pct is not None and pct != last_pct:
+                        last_pct = pct
+                        try:
+                            await status.edit_text(f"Downloading... {pct}%")
+                        except Exception:
+                            pass
+                elif status_text in ('finished', 'error'):
+                    try:
+                        await status.edit_text(f"{status_text.capitalize()}.")
+                    except Exception:
+                        pass
+
+        watcher_task = asyncio.create_task(progress_watcher())
+
+        filename = await download_task
+        await watcher_task
+
+        if not filename or not os.path.exists(filename):
+            await status.edit_text("Download failed or produced no file.")
+            return
+
+        size_bytes = os.path.getsize(filename)
+        size_mb = size_bytes / (1024 * 1024)
+
+        if size_mb > MAX_FILE_MB:
+            await status.edit_text("File exceeds Telegram size limit. Uploading to S3 and providing a link...")
+            # upload to s3
+            key = os.path.basename(filename)
+            s3_key = await asyncio.to_thread(storage.upload_file_to_s3, filename, key)
+            url_link = storage.generate_presigned_url(s3_key)
+            await query.message.reply_text(f"File is too large to send here. Download it from: {url_link}")
+            await status.delete()
+        else:
+            await status.edit_text("Sending file via Telegram...")
+            with open(filename, 'rb') as f:
+                await query.message.reply_document(document=InputFile(f, filename=os.path.basename(filename)))
+            await status.delete()
+
+    except Exception as e:
+        logger.exception("Download/send failed")
+        await status.edit_text(f"Operation failed: {e}")
+    finally:
+        # cleanup
+        try:
+            for root, dirs, files in os.walk(tmpdir, topdown=False):
+                for name in files:
+                    try:
+                        os.remove(os.path.join(root, name))
+                    except Exception:
+                        pass
+                for name in dirs:
+                    try:
+                        os.rmdir(os.path.join(root, name))
+                    except Exception:
+                        pass
+            try:
+                os.rmdir(tmpdir)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+
+if __name__ == '__main__':
+    token = config.BOT_TOKEN
+    if not token or token == 'YOUR_BOT_TOKEN':
+        logger.error('BOT_TOKEN not set. Please configure it in .env or environment.')
+        raise SystemExit('BOT_TOKEN not configured')
+
+    app = Application.builder().token(token).build()
+    app.add_handler(CommandHandler('start', start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    logger.info('Starting bot...')
+    app.run_polling()
