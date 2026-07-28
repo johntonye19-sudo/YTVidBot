@@ -1,0 +1,12 @@
+```text name=.gitignore
+# Ignore environment and caches
+.env
+downloads/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+env/
+venv/
+.idea/
+.vscode/
