@@ -11,7 +11,8 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from services import yt_service, storage
+# import the actual module name in the services directory
+from services import yt_services as yt_service, storage
 import config
 
 # Setup logging
@@ -106,14 +107,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     tmpdir = tempfile.mkdtemp(prefix='ytbot_')
 
     try:
-        # run download in thread
-        download_task = asyncio.to_thread(
-            yt_service.download_with_progress,
-            url,
-            download_type,
-            tmpdir,
-            progress_reporter,
-            format_label,
+        # run download in a background Task wrapping the thread call
+        download_future = asyncio.create_task(
+            asyncio.to_thread(
+                yt_service.download_with_progress,
+                url,
+                download_type,
+                tmpdir,
+                progress_reporter,
+                format_label,
+            )
         )
 
         # Start a coroutine that reads progress_queue and edits the status message
@@ -124,17 +127,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     d = await asyncio.wait_for(progress_queue.get(), timeout=0.5)
                 except asyncio.TimeoutError:
                     # check if download finished
-                    if download_task.done():
+                    if download_future.done():
                         break
                     continue
 
                 status_text = d.get('status')
                 if status_text == 'downloading':
-                    pct = d.get('downloaded_bytes') and d.get('total_bytes') and (
-                        round(d['downloaded_bytes'] / d['total_bytes'] * 100, 1)
-                        if d['total_bytes']
-                        else None
-                    )
+                    downloaded = d.get('downloaded_bytes')
+                    total = d.get('total_bytes')
+                    pct = None
+                    if downloaded is not None and total:
+                        try:
+                            pct = round(downloaded / total * 100, 1)
+                        except Exception:
+                            pct = None
                     if pct is not None and pct != last_pct:
                         last_pct = pct
                         try:
@@ -149,7 +155,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         watcher_task = asyncio.create_task(progress_watcher())
 
-        filename = await download_task
+        filename = await download_future
         await watcher_task
 
         if not filename or not os.path.exists(filename):
